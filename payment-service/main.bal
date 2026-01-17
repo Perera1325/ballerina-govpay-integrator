@@ -4,18 +4,24 @@ import ballerina/uuid;
 import ballerina/log;
 
 // --------------------
+// Config
+// --------------------
+configurable string API_KEY = "govpay-secret-123";
+configurable int RATE_LIMIT = 5;
+
+// --------------------
 // Models
 // --------------------
 type PaymentRequest record {|
     decimal amount;
     string currency;
-    string provider;   // dialog | genie | bank
+    string provider;
     string reference;
 |};
 
 type PaymentRecord record {|
     string paymentId;
-    string status;     // PENDING | SUCCESS | FAILED
+    string status;
     decimal amount;
     string currency;
     string provider;
@@ -41,9 +47,10 @@ type ProviderPayResponse record {|
 |};
 
 // --------------------
-// In-memory store
+// Stores
 // --------------------
 map<PaymentRecord> paymentStore = {};
+map<int> rateStore = {}; // apiKey -> requestCount
 
 // --------------------
 // Provider clients
@@ -53,7 +60,7 @@ final http:Client genieClient  = check new ("http://localhost:9002");
 final http:Client bankClient   = check new ("http://localhost:9003");
 
 // --------------------
-// Helper
+// Helpers
 // --------------------
 function callProvider(string provider, ProviderPayRequest req)
         returns ProviderPayResponse|error {
@@ -65,8 +72,44 @@ function callProvider(string provider, ProviderPayRequest req)
     } else if provider == "bank" {
         return check bankClient->post("/pay", req);
     }
-
     return error("Unsupported provider: " + provider);
+}
+
+// ✅ safe get header (works in older Ballerina)
+function getHeaderValue(http:Request req, string name) returns string? {
+    string|http:HeaderNotFoundError v = req.getHeader(name);
+    if v is http:HeaderNotFoundError {
+        return ();
+    }
+    return v;
+}
+
+// ✅ correlation id
+function getCorrelationId(http:Request req) returns string {
+    string? cid = getHeaderValue(req, "x-correlation-id");
+    if cid is () {
+        return uuid:createType1AsString();
+    }
+    return cid;
+}
+
+// ✅ API key validate
+function validateApiKey(http:Request req) returns boolean {
+    string? key = getHeaderValue(req, "x-api-key");
+    if key is () {
+        return false;
+    }
+    return key == API_KEY;
+}
+
+// ✅ simple rate limit: max RATE_LIMIT requests total per key (for demo)
+function rateLimitOk(string apiKey) returns boolean {
+    int count = rateStore[apiKey] ?: 0;
+    if count >= RATE_LIMIT {
+        return false;
+    }
+    rateStore[apiKey] = count + 1;
+    return true;
 }
 
 // --------------------
@@ -74,23 +117,41 @@ function callProvider(string provider, ProviderPayRequest req)
 // --------------------
 service / on new http:Listener(8080) {
 
-    resource function post pay(@http:Payload PaymentRequest req)
-            returns PaymentRecord|http:BadRequest {
+    resource function post pay(http:Request request, @http:Payload PaymentRequest req)
+            returns PaymentRecord|http:Response|http:BadRequest {
 
-        // Validate
+        string cid = getCorrelationId(request);
+
+        // ✅ API key security
+        if !validateApiKey(request) {
+            http:Response res = new;
+            res.statusCode = 401;
+            res.setHeader("x-correlation-id", cid);
+            res.setPayload({ "error": "Unauthorized. Missing/invalid x-api-key" });
+            return res;
+        }
+
+        string apiKey = getHeaderValue(request, "x-api-key") ?: "";
+
+        // ✅ rate limit
+        if !rateLimitOk(apiKey) {
+            http:Response res = new;
+            res.statusCode = 429;
+            res.setHeader("x-correlation-id", cid);
+            res.setPayload({ "error": "Too Many Requests. Rate limit exceeded." });
+            return res;
+        }
+
+        // ✅ Validate payload
         if req.amount <= 0d {
             return <http:BadRequest>{ body: { "error": "Amount must be > 0" } };
         }
-
         if req.currency.trim().length() == 0 || req.provider.trim().length() == 0 || req.reference.trim().length() == 0 {
-            return <http:BadRequest>{
-                body: { "error": "currency, provider, reference are required" }
-            };
+            return <http:BadRequest>{ body: { "error": "currency, provider, reference are required" } };
         }
 
         string provider = req.provider.trim().toLowerAscii();
 
-        // Create record
         string paymentId = uuid:createType1AsString();
         string createdAt = time:utcToString(time:utcNow());
 
@@ -102,13 +163,14 @@ service / on new http:Listener(8080) {
             provider: provider,
             reference: req.reference,
             createdAt: createdAt,
-            providerTxnId: (),       // ✅ FIX
-            providerMessage: ()      // ✅ FIX
+            providerTxnId: (),
+            providerMessage: ()
         };
 
         paymentStore[paymentId] = rec;
 
-        // Call provider
+        log:printInfo("[" + cid + "] /pay request => provider=" + provider);
+
         ProviderPayRequest pReq = {
             paymentId,
             amount: req.amount,
@@ -119,11 +181,12 @@ service / on new http:Listener(8080) {
         ProviderPayResponse|error pRes = callProvider(provider, pReq);
 
         if pRes is error {
-            log:printError("Provider call failed", 'error = pRes);
+            log:printError("[" + cid + "] Provider call failed", 'error = pRes);
 
             rec.status = "FAILED";
             rec.providerMessage = pRes.message();
             paymentStore[paymentId] = rec;
+
             return rec;
         }
 
@@ -135,21 +198,28 @@ service / on new http:Listener(8080) {
         return rec;
     }
 
-    resource function get payments/[string id]()
-            returns PaymentRecord|http:NotFound {
+    resource function get payments/[string id](http:Request request)
+            returns PaymentRecord|http:Response|http:NotFound {
+
+        string cid = getCorrelationId(request);
+
+        if !validateApiKey(request) {
+            http:Response res = new;
+            res.statusCode = 401;
+            res.setHeader("x-correlation-id", cid);
+            res.setPayload({ "error": "Unauthorized. Missing/invalid x-api-key" });
+            return res;
+        }
 
         PaymentRecord? rec = paymentStore[id];
-
         if rec is () {
-            return <http:NotFound>{
-                body: { "error": "Payment not found", "paymentId": id }
-            };
+            return <http:NotFound>{ body: { "error": "Payment not found", "paymentId": id } };
         }
 
         return rec;
     }
 
     resource function get health() returns map<string> {
-        return { "status": "UP", "service": "GovPay Integrator - Payment Service" };
+        return { "status": "UP", "service": "GovPay Integrator - Payment Service (Secured)" };
     }
 }
