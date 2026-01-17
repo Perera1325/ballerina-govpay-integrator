@@ -1,6 +1,7 @@
 import ballerina/http;
 import ballerina/time;
 import ballerina/uuid;
+import ballerina/log;
 
 // --------------------
 // Models
@@ -8,8 +9,8 @@ import ballerina/uuid;
 type PaymentRequest record {|
     decimal amount;
     string currency;
-    string provider;   // dialog | genie | bank (Day 3 we implement routing)
-    string reference;  // BILL123 / ORDER999
+    string provider;   // dialog | genie | bank
+    string reference;
 |};
 
 type PaymentRecord record {|
@@ -20,52 +21,77 @@ type PaymentRecord record {|
     string provider;
     string reference;
     string createdAt;
+    string? providerTxnId;
+    string? providerMessage;
+|};
+
+type ProviderPayRequest record {|
+    string paymentId;
+    decimal amount;
+    string currency;
+    string reference;
+|};
+
+type ProviderPayResponse record {|
+    string provider;
+    string providerTxnId;
+    string status;
+    string message;
+    string timestamp;
 |};
 
 // --------------------
-// In-memory store (Day 5 we replace with DB)
+// In-memory store
 // --------------------
 map<PaymentRecord> paymentStore = {};
+
+// --------------------
+// Provider clients
+// --------------------
+final http:Client dialogClient = check new ("http://localhost:9001");
+final http:Client genieClient  = check new ("http://localhost:9002");
+final http:Client bankClient   = check new ("http://localhost:9003");
+
+// --------------------
+// Helper
+// --------------------
+function callProvider(string provider, ProviderPayRequest req)
+        returns ProviderPayResponse|error {
+
+    if provider == "dialog" {
+        return check dialogClient->post("/pay", req);
+    } else if provider == "genie" {
+        return check genieClient->post("/pay", req);
+    } else if provider == "bank" {
+        return check bankClient->post("/pay", req);
+    }
+
+    return error("Unsupported provider: " + provider);
+}
 
 // --------------------
 // Service
 // --------------------
 service / on new http:Listener(8080) {
 
-    // ✅ POST /pay  -> Create a payment request
     resource function post pay(@http:Payload PaymentRequest req)
             returns PaymentRecord|http:BadRequest {
 
-        // ✅ Validate amount (decimal comparison must use decimal literal 0d)
+        // Validate
         if req.amount <= 0d {
+            return <http:BadRequest>{ body: { "error": "Amount must be > 0" } };
+        }
+
+        if req.currency.trim().length() == 0 || req.provider.trim().length() == 0 || req.reference.trim().length() == 0 {
             return <http:BadRequest>{
-                body: { "error": "Invalid amount. Amount must be greater than 0." }
+                body: { "error": "currency, provider, reference are required" }
             };
         }
 
-        // ✅ Validate required fields
-        if req.currency.trim().length() == 0 {
-            return <http:BadRequest>{
-                body: { "error": "Currency is required. Example: LKR" }
-            };
-        }
+        string provider = req.provider.trim().toLowerAscii();
 
-        if req.provider.trim().length() == 0 {
-            return <http:BadRequest>{
-                body: { "error": "Provider is required. Example: dialog/genie/bank" }
-            };
-        }
-
-        if req.reference.trim().length() == 0 {
-            return <http:BadRequest>{
-                body: { "error": "Reference is required. Example: BILL_CEB_10023" }
-            };
-        }
-
-        // ✅ Generate paymentId
+        // Create record
         string paymentId = uuid:createType1AsString();
-
-        // ✅ Create record
         string createdAt = time:utcToString(time:utcNow());
 
         PaymentRecord rec = {
@@ -73,18 +99,42 @@ service / on new http:Listener(8080) {
             status: "PENDING",
             amount: req.amount,
             currency: req.currency,
-            provider: req.provider,
+            provider: provider,
             reference: req.reference,
-            createdAt
+            createdAt: createdAt,
+            providerTxnId: (),       // ✅ FIX
+            providerMessage: ()      // ✅ FIX
         };
 
-        // ✅ Store record
+        paymentStore[paymentId] = rec;
+
+        // Call provider
+        ProviderPayRequest pReq = {
+            paymentId,
+            amount: req.amount,
+            currency: req.currency,
+            reference: req.reference
+        };
+
+        ProviderPayResponse|error pRes = callProvider(provider, pReq);
+
+        if pRes is error {
+            log:printError("Provider call failed", 'error = pRes);
+
+            rec.status = "FAILED";
+            rec.providerMessage = pRes.message();
+            paymentStore[paymentId] = rec;
+            return rec;
+        }
+
+        rec.status = pRes.status;
+        rec.providerTxnId = pRes.providerTxnId;
+        rec.providerMessage = pRes.message;
         paymentStore[paymentId] = rec;
 
         return rec;
     }
 
-    // ✅ GET /payments/{id} -> Fetch payment details
     resource function get payments/[string id]()
             returns PaymentRecord|http:NotFound {
 
@@ -92,21 +142,14 @@ service / on new http:Listener(8080) {
 
         if rec is () {
             return <http:NotFound>{
-                body: {
-                    "error": "Payment not found",
-                    "paymentId": id
-                }
+                body: { "error": "Payment not found", "paymentId": id }
             };
         }
 
         return rec;
     }
 
-    // ✅ GET /health -> Health check
     resource function get health() returns map<string> {
-        return {
-            "status": "UP",
-            "service": "GovPay Integrator - Payment Service"
-        };
+        return { "status": "UP", "service": "GovPay Integrator - Payment Service" };
     }
 }
