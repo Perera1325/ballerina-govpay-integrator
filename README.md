@@ -1,6 +1,12 @@
-# 🇱🇰 GovPay Integrator — Ballerina + WSO2 API Manager (OAuth2/JWT)
+<img width="1536" height="1024" alt="banner png" src="https://github.com/user-attachments/assets/0fa94f12-60f8-4652-ab6c-b28e3dac750b" /># 🇱🇰 GovPay Integrator — Ballerina + WSO2 API Manager (OAuth2/JWT)
 
 A real-world Sri Lankan government payment integration simulation built using **Ballerina microservices** and published through **WSO2 API Manager** with **OAuth2/JWT security, throttling, and API subscription**.
+
+<p align="center">
+  <img src="assets/banner.png" alt="GovPay Banner" width="100%">
+</p>
+
+
 
 This project demonstrates the exact skills required for **WSO2 Integration Engineer / API Engineer roles**:  
 ✅ API orchestration • ✅ API Gateway security • ✅ Microservices • ✅ Rate limiting • ✅ Persistence • ✅ DevPortal publishing
