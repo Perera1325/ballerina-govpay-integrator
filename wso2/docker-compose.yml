@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  apim:
+    image: wso2/wso2am:4.3.0
+    container_name: wso2apim
+    ports:
+      - "9443:9443"
+      - "8243:8243"
+      - "8280:8280"
+    environment:
+      - JAVA_OPTS=-Duser.timezone=Asia/Colombo
